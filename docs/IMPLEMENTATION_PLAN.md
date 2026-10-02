@@ -121,7 +121,7 @@ Having everything for Phases 0–3 ready before Phase 0 avoids sessions stalling
 1. **Tree-sitter parsing** — `web-tree-sitter` with **TS/JS and Python** grammars (D12); extract symbols + imports into `files`; regex import detection for other languages; time budgets and graceful fallback.
 2. **Chunker** — AST-aware chunking, merge/split rules, line-window fallback, contextual headers, token counting; golden-file tests.
 3. **Secret redaction (minimal)** — core secret rules applied to chunk text before persistence/embedding (full scanner comes in Phase 4).
-4. **Embedding provider** — `EmbeddingProvider` interface; OpenRouter implementation (`voyageai/voyage-code-4`) with Voyage-direct fallback; spike to confirm `output_dimension` (1024 vs 512) support; batching, concurrency, retries, `data_collection: "deny"`, vector reuse from the previous snapshot by (`embeddingModel`, `contentHash`), usage metering into `usageEvents`.
+4. **Embedding provider** — `EmbeddingProvider` interface; OpenRouter implementation (`voyageai/voyage-code-4`) with Voyage-direct fallback; spike to confirm `output_dimension` (1024 vs 512) support; batching, concurrency, retries, `data_collection: "deny"`, vector reuse from the previous snapshot by `embeddingInputHash` when model + dimensions match, usage metering into `usageEvents`.
 5. **Chunks + indexes** — `chunks` model with BSON `binData` float32 vectors, bulk insert, search-index script (`chunks_vector`, `chunks_text` with code analyzer) for Atlas and Atlas Local, snapshot `ready` transition + active-snapshot flip + GC job (keep last 2 snapshots).
 6. **Search service** — vector search (pre-filtered by `snapshotId`), text search, app-side RRF fusion, path/symbol boosting, filters (`language`, `dir`, `kind`), highlights; `POST /repositories/:id/search`; integration tests against the `mongodb-atlas-local` container.
 7. **Web: search** — Search tab with mode toggle, filters, result cards (path, lines, highlighted snippet) that deep-link into the file viewer.
@@ -130,7 +130,7 @@ Having everything for Phases 0–3 ready before Phase 0 avoids sessions stalling
 - Natural-language queries (e.g. "where are JWTs verified?") surface the right file in the top 5 for the fixture repos.
 - Exact identifier queries return the defining chunk first.
 - Search on a snapshot never returns chunks from another snapshot/repo (tested).
-- Re-indexing an unchanged commit performs zero new embedding calls (vector reuse).
+- Re-indexing an unchanged commit performs zero new embedding calls (vector reuse); a moved file or renamed symbol is re-embedded.
 
 **External waits**: OpenRouter key (with credit limit).
 
@@ -163,11 +163,13 @@ Having everything for Phases 0–3 ready before Phase 0 avoids sessions stalling
 
 **Goal**: actionable dependency, security and code-health reports, plus an interactive architecture view. One phase because all analyzers reuse the parsed files and share the findings UI.
 
+File scans (manifests, secrets/patterns, quality metrics) plug into the file-scan stage of `ingest.snapshot`, which owns the extracted tarball; network/AI enrichment (registries, OSV, import graph, AI triage/reviews) runs in `analyze.snapshot` from persisted data (ARCHITECTURE.md §7.2).
+
 **PRs**
 1. **Manifest parsers** — npm (package.json + npm/pnpm/yarn lockfiles), Python (requirements, pyproject, poetry.lock), Go (go.mod/go.sum), Cargo; direct vs transitive, scopes → `dependencies`.
 2. **Registry enrichment + OSV** — latest version, license (npm, PyPI, Go proxy, crates.io) with 24 h caching; semver outdated classification; OSV `querybatch` → `findings(category=vulnerability)`.
 3. **Secret scanner + risky patterns** — full secret rule set + entropy, allowlists, ReDoS-safe patterns, redacted snippets + fingerprints; per-language AST/regex rules, GitHub Actions and Dockerfile checks.
-4. **Findings API + dismissals + AI triage** — list/filter/paginate, `PATCH /findings/:id`, fingerprint carry-over across snapshots; `FAST_MODEL` explanations for high/critical findings, capped per snapshot.
+4. **Findings API + dismissals + AI triage** — list/filter/paginate, per-user `findingDismissals` overlaid on shared findings, `PATCH /findings/:id`, fingerprint carry-over across snapshots; `FAST_MODEL` explanations for high/critical findings, capped per snapshot.
 5. **Import graph + architecture analyzer** — resolve imports (relative, tsconfig paths, Python packages), file-level graph, directory aggregation, SCC cycle detection, centrality; layer classification + narrative (`FAST_MODEL`), Mermaid export → `analyses(type=architecture)`.
 6. **Quality metrics + hotspots** — per-function/file metrics (tree-sitter for TS/JS + Python, line-based heuristics elsewhere), duplication, TODO counts, test ratio; transparent scorecard; cited AI suggestions for top-N hotspots.
 7. **Web** — Dependencies tab, Security tab (severity summary, findings table, detail drawer, dismiss flow), Quality tab (scorecard, hotspots linked to code), Architecture tab (React Flow + ELK layout, depth control, drill-down, "Ask about this module" → pre-filled chat).
@@ -175,7 +177,7 @@ Having everything for Phases 0–3 ready before Phase 0 avoids sessions stalling
 **Acceptance criteria**
 - Known-vulnerable fixture dependencies are reported with correct advisory IDs.
 - Planted fake secrets in a fixture repo are detected; the raw secret value never appears in DB, logs, LLM requests or UI.
-- Dismissed findings stay dismissed after re-index.
+- Dismissed findings stay dismissed after re-index for the dismissing user only; other users with access still see them open (tested).
 - Graph for a ~1,000-file repo renders interactively; a known circular dependency in a fixture is detected.
 - Every AI quality suggestion cites at least one file range.
 

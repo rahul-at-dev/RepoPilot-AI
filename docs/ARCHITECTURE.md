@@ -78,7 +78,7 @@ Detailed rationale, verified pricing/limits and alternatives are in [`DECISIONS_
 | D4 | **Embeddings** | **`voyageai/voyage-code-4` via OpenRouter** (`/api/v1/embeddings`, $0.12/M tokens), 1024 dims (512 if the endpoint supports `output_dimension`), stored as BSON **`binData` float32**. Fallback: Voyage API directly (same model → compatible vectors). Model + dims recorded per snapshot; a change forces re-index. |
 | D5 | **Chat / summarisation models** | OpenRouter, env-configured: `CHAT_MODEL=google/gemini-2.5-flash`, `FAST_MODEL=google/gemini-2.5-flash-lite`, optional `PREMIUM_CHAT_MODEL` (Claude Sonnet-class) toggle for demos. Final picks validated by the Phase 3 eval harness. No `:free` models in production. |
 | D6 | **Tenancy** | **Personal accounts only**, everything keyed by `userId`. No `workspaceId` in v1 (teams via Clerk Organizations is a backlog item with a small backfill migration). |
-| D7 | **Shared indexes** | **Shared.** One `repositories` doc per GitHub repo; one snapshot per (repo, commit, embedding model) reused by every user with access. Conversations, feedback and dismissals stay per user. Private-repo access re-verified against GitHub. |
+| D7 | **Shared indexes** | **Shared.** One `repositories` doc per GitHub repo; one snapshot per (repo, commit, embedding model) reused by every user with access. Conversations, feedback and finding dismissals (`findingDismissals`) stay per user. Private-repo access re-verified against GitHub. |
 | D8 | **Repo size limits** | ≤ 2,000 indexable files, ≤ 20 MB of text, single file ≤ 512 KB, ≤ 3 repos per user, plus a **global daily import cap**. All configurable. |
 | D9 | **Index freshness** | **Manual** re-index in v1; `push` webhook → incremental re-index only with the optional Phase 7. |
 | D10 | **Branch/ref support** | Default branch in the UI; API accepts any branch/tag/SHA. One active snapshot per repo. |
@@ -290,7 +290,7 @@ const job = await Job.findOneAndUpdate(
 - Exponential backoff on failure up to `maxAttempts`, then `failed` with `lastError`.
 - `dedupeKey` (unique partial index on non-terminal jobs) prevents duplicate ingestions of the same repo/ref.
 - Concurrency configurable (default 1 ingestion at a time on the Starter instance); per-user concurrent ingestion limit and the global daily import cap are enforced at enqueue time.
-- Job types: `ingest.snapshot`, `analyze.snapshot`, `docs.generate`, `snapshot.gc`, `repo.delete`, `deps.refreshAdvisories` (scheduled).
+- Job types: `ingest.snapshot` (owns the extracted tarball and runs every file-dependent stage), `analyze.snapshot` (network/AI enrichment from persisted data only), `docs.generate`, `snapshot.gc`, `repo.delete`, `deps.refreshAdvisories` (scheduled).
 
 ### 7.2 Ingestion stages (`ingest.snapshot`)
 
@@ -303,13 +303,15 @@ flowchart TD
   C --> D[classify files<br/>language, LOC, isTest, isConfig]
   D --> E[persist file metadata<br/>no full contents, D14]
   E --> F[parse: tree-sitter → symbols, imports]
-  F --> G[chunk: AST-aware, fallback line windows]
+  F --> S[file scans on extracted files<br/>structure, manifests → dependencies,<br/>secrets + risky patterns → findings,<br/>quality metrics → analyses]
+  S --> G[chunk: AST-aware, fallback line windows]
   G --> H[redact secrets from chunk text]
-  H --> I[embed in batches<br/>reuse vectors from previous<br/>snapshot by contentHash]
+  H --> I[embed in batches<br/>reuse vectors by embeddingInputHash<br/>if model + dims match]
   I --> J[bulk insert chunks]
-  J --> K[enqueue analyze.snapshot]
-  K --> L[mark snapshot ready<br/>flip repository.activeSnapshotId]
-  L --> M[enqueue GC of previous snapshot]
+  J --> L[mark snapshot ready<br/>flip repository.activeSnapshotId]
+  L --> K[enqueue analyze.snapshot<br/>OSV, registries, import graph,<br/>AI summaries/triage/reviews]
+  K --> M[enqueue GC of previous snapshot]
+  M --> T[finally: delete temp extraction dir]
 ```
 
 Notes:
@@ -317,8 +319,9 @@ Notes:
 - **Tarball over Trees+Blobs API**: one request for the whole repo instead of one per file — critical for rate limits.
 - **Safe extraction**: reject absolute paths and `..` (zip-slip), skip symlinks/devices, cap total decompressed bytes and file count (archive-bomb protection), stream rather than buffer.
 - **Filters**: built-in ignore list (`node_modules/`, `vendor/`, `dist/`, `build/`, `.min.js`, images, fonts, archives, media), binary detection (NUL byte sniff), generated-file heuristics (`// Code generated`, `@generated`), plus optional user `.repopilotignore` and include/exclude globs in repo settings.
-- **Search readiness before analysis**: the snapshot becomes `ready` for browsing/search/chat as soon as chunks are embedded; analyzers run afterwards and their status is tracked per analyzer.
-- **Embedding reuse** (all re-indexes): before embedding, look up chunks with the same `contentHash` + `embeddingModel` in the repository's previous snapshot and copy their vectors; only new/changed chunks hit the embedding API.
+- **Extraction ownership**: the extracted tarball lives in a temp directory owned by the `ingest.snapshot` job and is deleted in a `finally` block when that job ends (success, failure or retry; a retry re-downloads). Every stage that needs file contents (parsing, structure, manifest parsing, secret/pattern scanning, quality metrics, chunking) therefore runs **inside** `ingest.snapshot`. These scans are local and deterministic (no network, no LLM), so they add seconds, not minutes.
+- **Search readiness before enrichment**: the snapshot becomes `ready` for browsing/search/chat as soon as chunks are embedded. `analyze.snapshot` then runs enrichment that needs only persisted data (`files`, `dependencies`, `findings`, `chunks`): OSV/registry lookups, import-graph resolution, architecture narrative, summaries, AI triage and hotspot reviews. Status is tracked per analyzer.
+- **Embedding reuse** (all re-indexes): if the previous snapshot's `embedding.model` **and** `embedding.dimensions` equal the new snapshot's, look up its chunks by `embeddingInputHash` (sha256 of the exact normalized embedding input, i.e. contextual header + chunk text, §7.3) and copy their vectors; only chunks whose embedded input changed (including moved files or renamed symbols) hit the embedding API.
 - **Webhook-driven incremental re-index** (optional Phase 7): additionally skip parsing of files whose blob SHA is unchanged.
 
 ### 7.3 Chunking strategy
@@ -434,11 +437,13 @@ File contents are **not** stored (D14). The file viewer fetches `GET /repos/{own
   kind: 'code' | 'file_summary' | 'doc',
   symbolName?: string, symbolKind?: string, startLine: number, endLine: number,
   content: string,            // display text (secrets redacted)
-  contentHash: string, tokenCount: number,
-  embedding: Binary,          // BSON binData float32 vector; dims per snapshot.embedding
+  contentHash: string,        // sha256 of display text
+  embeddingInputHash: string, // sha256 of exact embedded input (contextual header + text)
+  tokenCount: number,
+  embedding: Binary,          // BSON binData float32 vector; model + dims per snapshot.embedding
   embeddingModel: string }
 ```
-Indexes: `{ snapshotId: 1, fileId: 1 }`, `{ repositoryId: 1, embeddingModel: 1, contentHash: 1 }` (embedding reuse across snapshots), plus Atlas Vector Search + Atlas Search indexes (§9).
+Indexes: `{ snapshotId: 1, fileId: 1 }`, `{ snapshotId: 1, embeddingInputHash: 1 }` (embedding reuse from the previous snapshot), plus Atlas Vector Search + Atlas Search indexes (§9).
 
 **`analyses`** — one document per analyzer per snapshot (typed `result` per `type`)
 ```ts
@@ -455,10 +460,17 @@ Index: `{ snapshotId: 1, type: 1 } unique`.
   title: string, description: string, path?: string, startLine?: number, endLine?: number,
   redactedSnippet?: string, fingerprint: string /*stable across snapshots*/,
   dependency?: { ecosystem: string, name: string, version: string, advisoryIds: string[] },
-  aiExplanation?: string, remediation?: string,
-  state: 'open' | 'dismissed', dismissedBy?: ObjectId, dismissReason?: string }
+  aiExplanation?: string, remediation?: string }
 ```
-Indexes: `{ snapshotId: 1, category: 1, severity: 1 }`, `{ repositoryId: 1, fingerprint: 1 }` (carry dismissals forward).
+Indexes: `{ snapshotId: 1, category: 1, severity: 1 }`, `{ repositoryId: 1, fingerprint: 1 }`.
+
+Findings are shared derived data (D7) and carry no user state.
+
+**`findingDismissals`** — per-user dismissal state, keyed by fingerprint so it survives re-indexing
+```ts
+{ userId, repositoryId, fingerprint: string, reason?: string, createdAt: Date }
+```
+Index: `{ userId: 1, repositoryId: 1, fingerprint: 1 } unique`. Listing findings overlays the caller's dismissals (`state = dismissed` if a matching record exists); one user's dismissal never changes what another user sees.
 
 **`dependencies`**
 ```ts
@@ -626,7 +638,7 @@ Details:
 
 ## 11. Feature designs (analyzers)
 
-All analyzers run in the worker loop on the extracted tarball during the snapshot job (before the temp directory is removed); none execute repository code. Each writes to `analyses` / `findings` / `dependencies` and updates `snapshot.analyzers[name]`.
+Analyzers are split by input (§7.2): **file scans** read the extracted tarball and run inside `ingest.snapshot` before its temp directory is deleted; **enrichment** runs in `analyze.snapshot` from persisted data only. None execute repository code. Each writes to `analyses` / `findings` / `dependencies` and updates `snapshot.analyzers[name]`.
 
 ### 11.1 Structure analysis
 - Tree with per-directory aggregates (files, LOC, languages).
@@ -652,7 +664,7 @@ All analyzers run in the worker loop on the extracted tarball during the snapsho
 - **Risky patterns** (per language): `eval`/`new Function`, `child_process.exec` with interpolation, SQL built by string concatenation, disabled TLS verification, weak hashes/ciphers, permissive CORS, `dangerouslySetInnerHTML`, insecure deserialization, hard-coded credentials in config.
 - **Config checks**: GitHub Actions using `pull_request_target` with checkout of PR code, unpinned third-party actions, Dockerfile running as root / `latest` tags.
 - **AI triage** (`FAST_MODEL`): explains each high/critical pattern finding, estimates likelihood of a true positive, proposes remediation — clearly labelled as AI-generated.
-- Dismissals persist across snapshots via `fingerprint`.
+- Dismissals are per user (`findingDismissals`) and persist across snapshots via `fingerprint`.
 
 ### 11.5 Dependency analysis
 - Parsers: `package.json` + `package-lock.json`/`pnpm-lock.yaml`/`yarn.lock`; `requirements*.txt`, `pyproject.toml`, `poetry.lock`; `go.mod`/`go.sum`; `Cargo.toml`/`Cargo.lock`; later `pom.xml`, `Gemfile.lock`. (Manifest parsing is independent of AST language support, D12.)
@@ -719,7 +731,7 @@ REST, JSON, base path `/api/v1`. Auth: `Authorization: Bearer <Clerk session tok
 | `GET /repositories/:repoId/architecture?depth=` | Graph `{ nodes, edges, layers, narrative, mermaid }` |
 | `GET /repositories/:repoId/quality` | Scorecard, metrics, hotspots, AI review |
 | `GET /repositories/:repoId/findings?category=&severity=&state=` | Security/quality findings (paginated) |
-| `PATCH /findings/:findingId` | Dismiss / reopen `{ state, reason }` |
+| `PATCH /findings/:findingId` | Dismiss / reopen for the caller only `{ state, reason }` (upserts/deletes `findingDismissals`) |
 | `GET /repositories/:repoId/dependencies?ecosystem=&outdated=&vulnerable=` | Dependency list + summary |
 | **Docs** | |
 | `GET /repositories/:repoId/docs` | Generated documents |
@@ -737,7 +749,7 @@ REST, JSON, base path `/api/v1`. Auth: `Authorization: Bearer <Clerk session tok
 | Repository & all derived data | Caller has a `repoAccess` row for `repositoryId`; for private repos the access must be backed by a linked, non-suspended installation that still includes the repo (re-verified on import, on webhook events, and lazily if `verifiedAt` > 24 h). |
 | Snapshot | Belongs to an accessible repository. |
 | Conversation / message | `conversation.userId === caller`. |
-| Finding dismissal | Repo access with role `owner`. |
+| Finding dismissal | Any user with repo access; affects only that user's own view. |
 | GitHub installation | Linked to the caller via verified OAuth flow. |
 
 ---
