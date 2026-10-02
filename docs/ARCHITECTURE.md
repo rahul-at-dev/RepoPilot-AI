@@ -1,6 +1,6 @@
 # RepoPilot AI — Architecture
 
-> Status: **Proposed** (awaiting approval). Nothing in this document is implemented yet.
+> Status: **Approved** (decisions D1–D15 approved; see [`DECISIONS_REVIEW.md`](./DECISIONS_REVIEW.md) for the reasoning, costs and trade-offs). Nothing in this document is implemented yet.
 > Companion document: [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md).
 
 RepoPilot AI is a GitHub repository intelligence platform. A user imports a repository; RepoPilot ingests it, indexes it for semantic search, runs static analyzers, and exposes an AI assistant that answers questions about the code with verifiable source-file citations.
@@ -10,7 +10,7 @@ RepoPilot AI is a GitHub repository intelligence platform. A user imports a repo
 ## Table of contents
 
 1. [Requirements analysis](#1-requirements-analysis)
-2. [Open decisions (need your input)](#2-open-decisions-need-your-input)
+2. [Approved decisions](#2-approved-decisions)
 3. [System overview](#3-system-overview)
 4. [Repository / code layout](#4-repository--code-layout)
 5. [Frontend architecture](#5-frontend-architecture)
@@ -66,27 +66,27 @@ RepoPilot AI is a GitHub repository intelligence platform. A user imports a repo
 
 ---
 
-## 2. Open decisions (need your input)
+## 2. Approved decisions
 
-Each item has a **recommendation** that the rest of this document assumes. Please confirm or override.
+Detailed rationale, verified pricing/limits and alternatives are in [`DECISIONS_REVIEW.md`](./DECISIONS_REVIEW.md).
 
-| # | Decision | Options | Recommendation |
-|---|---|---|---|
-| D1 | **How we access GitHub** | (a) Clerk GitHub OAuth token, (b) user Personal Access Tokens, (c) **GitHub App** | **Public repos (Phase 1):** server-side service token (read-only) for 5,000 req/h. **Private repos (Phase 7):** a **GitHub App** with `Contents: read` + `Metadata: read`. Short-lived installation tokens, per-repo consent, no long-lived user secrets stored. Clerk's GitHub OAuth `repo` scope grants full read/write to all repos — too broad. |
-| D2 | **Backend hosting** (Vercel is frontend only) | Render, Railway, Fly.io, AWS (ECS/App Runner) | **Render** (or Railway): one *web service* (API) + one *background worker* from the same Docker image. Both support long-running Node processes. |
-| D3 | **Job queue** | (a) **MongoDB-backed queue**, (b) BullMQ + Redis (Upstash) | **(a) MongoDB-backed** for v1: zero extra infra, durable, atomic claims with leases. Hidden behind a `JobQueue` interface so we can switch to BullMQ if throughput demands it. |
-| D4 | **Embedding model/provider** | OpenRouter embeddings (verify availability/models), Voyage `voyage-code-3` (code-specialised, MongoDB-owned), OpenAI `text-embedding-3-small` | Use **OpenRouter** if it exposes a suitable code-capable embedding model at implementation time (single vendor); otherwise **Voyage `voyage-code-3`** directly. Behind an `EmbeddingProvider` interface; model name + dimensions stored on every chunk so a model change triggers a re-index, never silent mixing. |
-| D5 | **Chat / summarisation models** | Any OpenRouter model | Two env-configured tiers: `CHAT_MODEL` (strong, e.g. a Claude Sonnet / GPT-class model) and `FAST_MODEL` (cheap, e.g. a Gemini Flash-class model) for summaries, query rewriting and triage. Fallback list via OpenRouter. |
-| D6 | **Tenancy model** | Personal only, or teams (Clerk Organizations) | **Personal for v1**, but every owned document carries `workspaceId` (= user's personal workspace) so Clerk Organizations can be enabled later without migration. |
-| D7 | **Shared indexes for public repos** | Per-user copies vs. one shared index per (repo, commit) | **Shared.** A public repo at a given commit is indexed once and reused by all users (big cost saving). Private repos are also stored once per GitHub repo id, but access is always re-verified against GitHub. |
-| D8 | **Repo size limits** | — | Free tier defaults: ≤ 5,000 indexable files, ≤ 50 MB of text, single file ≤ 1 MB, ≤ 3 repos per user. Configurable per plan. |
-| D9 | **Index freshness** | Manual re-index, scheduled, webhook on push | **Manual** in v1; **GitHub App `push` webhook → incremental re-index** in Phase 7. |
-| D10 | **Branch/ref support** | Default branch only, any ref | Default branch by default; allow any branch/tag/SHA at import. One active snapshot per repo in v1. |
-| D11 | **Atlas tier** | Free (M0) / Flex / dedicated (M10+) | **M0/Flex for development**, **M10+ for production** (storage for vectors, search-node headroom, backups). Verify current Atlas Vector Search limits per tier before launch. |
-| D12 | **AST parsing languages in v1** | — | TypeScript/JavaScript, Python, Go, Java via `web-tree-sitter` (WASM). Everything else falls back to line-based chunking and regex import detection. |
-| D13 | **Monetisation** | None / Stripe plans | Not in v1; usage is metered from day one (`usageEvents`) so plans can be added later. |
-| D14 | **Data retention & privacy** | — | Store indexed file contents (needed for viewer + citations). Delete all derived data when the last user removes a repo or on account deletion. Send code to LLM providers only via OpenRouter with provider data-collection opt-out enabled; disclose this in the UI. |
-| D15 | **Monorepo tooling** | npm/pnpm workspaces, Turborepo, Nx | **pnpm workspaces** (+ Turborepo only if build times warrant it). |
+| # | Decision | Approved choice |
+|---|---|---|
+| D1 | **GitHub access** | Public repos via a server-side, read-only **service token** (5,000 req/h) and one tarball download per import. Private repos via a **GitHub App** (`Contents: read`, `Metadata: read`, short-lived installation tokens) in the **optional** Phase 7. Clerk's GitHub OAuth `repo` scope is not used (grants read/write to everything). |
+| D2 | **Backend hosting** | **Render, one web service** running the API **and** the job worker in the same process (`RUN_WORKER=true`). Free instance for development, **Starter ($7/mo)** for the always-on demo. Separate `server.ts` / `worker.ts` entrypoints are kept so a dedicated background worker can be split out later without code changes. |
+| D3 | **Job queue** | **MongoDB-backed** `jobs` collection (atomic claim, lease + heartbeat, backoff, `dedupeKey`), behind a `JobQueue` interface (BullMQ swap possible later). |
+| D4 | **Embeddings** | **`voyageai/voyage-code-4` via OpenRouter** (`/api/v1/embeddings`, $0.12/M tokens), 1024 dims (512 if the endpoint supports `output_dimension`), stored as BSON **`binData` float32**. Fallback: Voyage API directly (same model → compatible vectors). Model + dims recorded per snapshot; a change forces re-index. |
+| D5 | **Chat / summarisation models** | OpenRouter, env-configured: `CHAT_MODEL=google/gemini-2.5-flash`, `FAST_MODEL=google/gemini-2.5-flash-lite`, optional `PREMIUM_CHAT_MODEL` (Claude Sonnet-class) toggle for demos. Final picks validated by the Phase 3 eval harness. No `:free` models in production. |
+| D6 | **Tenancy** | **Personal accounts only**, everything keyed by `userId`. No `workspaceId` in v1 (teams via Clerk Organizations is a backlog item with a small backfill migration). |
+| D7 | **Shared indexes** | **Shared.** One `repositories` doc per GitHub repo; one snapshot per (repo, commit, embedding model) reused by every user with access. Conversations, feedback and finding dismissals (`findingDismissals`) stay per user. Private-repo access re-verified against GitHub. |
+| D8 | **Repo size limits** | ≤ 2,000 indexable files, ≤ 20 MB of text, single file ≤ 512 KB, ≤ 3 repos per user, plus a **global daily import cap**. All configurable. |
+| D9 | **Index freshness** | **Manual** re-index in v1; `push` webhook → incremental re-index only with the optional Phase 7. |
+| D10 | **Branch/ref support** | Default branch in the UI; API accepts any branch/tag/SHA. One active snapshot per repo. |
+| D11 | **Atlas tier** | **Atlas Free (M0)** for dev and the demo, in separate Atlas projects (2 of the 3 allowed search indexes used; 512 MB storage). Upgrade to **Flex** ($8–30/mo) at ~400 MB; M10+ only with real users/backups. Local dev and CI use the **`mongodb/mongodb-atlas-local`** Docker image (supports `$search` + `$vectorSearch`). |
+| D12 | **AST parsing languages in v1** | **TypeScript/JavaScript and Python** via `web-tree-sitter` (WASM). Everything else uses line-based chunking + regex import detection; Go/Java are backlog. |
+| D13 | **Monetisation** | None in v1. Usage metered from day one (`usageEvents`), per-user monthly token cap, and a **hard credit limit on the OpenRouter API key** (separate dev/prod keys). |
+| D14 | **Data retention & privacy** | **No full file contents stored**: the viewer fetches files from GitHub at the snapshot's immutable commit SHA (in-memory LRU cache). Chunks store redacted snippets only. Every OpenRouter call sends `provider: { data_collection: "deny" }`. Derived data deleted when the last user removes a repo or on account deletion. |
+| D15 | **Monorepo tooling** | **pnpm workspaces** only (no Turborepo). |
 
 ---
 
@@ -102,9 +102,9 @@ flowchart LR
     CL[Clerk]
   end
 
-  subgraph Backend["Backend (Render: one image, two processes)"]
-    API[API service<br/>Express + TS]
-    WK[Worker service<br/>job runner + analyzers]
+  subgraph Backend["Backend (Render: one web service, one process)"]
+    API[API<br/>Express + TS]
+    WK[In-process worker<br/>job runner + analyzers<br/>RUN_WORKER=true]
   end
 
   subgraph Data["MongoDB Atlas"]
@@ -125,7 +125,8 @@ flowchart LR
   CL -- webhooks (svix) --> API
   API <--> DB
   API -- $vectorSearch / $search --> VS & FTS
-  API -- streaming chat --> OR
+  API -- streaming chat, query embeddings --> OR
+  API -- file content at commit SHA --> GH
   API -- enqueue jobs --> DB
   WK -- claim jobs --> DB
   WK -- tarball / metadata --> GH
@@ -137,8 +138,8 @@ flowchart LR
 **Key properties**
 
 - The SPA talks only to our API (never directly to GitHub or OpenRouter). All third-party keys live server-side.
-- The API is stateless and horizontally scalable. All long work is enqueued as jobs in MongoDB and executed by the worker.
-- API and worker share one codebase/image (`apps/api`) with two entrypoints, so models, repositories and services are shared.
+- HTTP handlers are stateless. All long work is enqueued as jobs in MongoDB and executed by the worker loop.
+- In v1 the API and worker run in **one process** on one Render service (`RUN_WORKER=true`). The code keeps two entrypoints (`server.ts`, `worker.ts`) so a dedicated Render background worker can be split out later by configuration only.
 - Every piece of derived data is keyed by `snapshotId` (repository + commit SHA).
 
 ---
@@ -156,10 +157,10 @@ RepoPilot-AI/
 │  │     ├─ components/ui/    # shadcn/ui primitives
 │  │     ├─ lib/api/          # typed API client (uses @repopilot/shared schemas)
 │  │     └─ lib/              # sse client, formatting, hooks
-│  └─ api/                    # Express + TS (Render) — API and worker entrypoints
+│  └─ api/                    # Express + TS (Render) — API + in-process worker
 │     └─ src/
-│        ├─ server.ts         # HTTP entrypoint
-│        ├─ worker.ts         # job-runner entrypoint
+│        ├─ server.ts         # HTTP entrypoint (also starts the worker loop if RUN_WORKER=true)
+│        ├─ worker.ts         # standalone job-runner entrypoint (for a future split)
 │        ├─ config/           # env parsing (zod), constants
 │        ├─ http/             # app factory, middleware, routes, controllers
 │        ├─ modules/          # domain modules (see §6.2)
@@ -173,12 +174,13 @@ RepoPilot-AI/
 ├─ packages/
 │  └─ shared/                 # Zod schemas + inferred types for API contracts,
 │                             # enums (job status, severity, languages), constants
-├─ docs/                      # ARCHITECTURE.md, IMPLEMENTATION_PLAN.md, ADRs
+├─ docs/                      # ARCHITECTURE.md, IMPLEMENTATION_PLAN.md, DECISIONS_REVIEW.md
+├─ docker-compose.yml         # local MongoDB (mongodb/mongodb-atlas-local)
 ├─ .github/workflows/         # CI: lint, typecheck, test, build
 └─ package.json / pnpm-workspace.yaml / tsconfig.base.json
 ```
 
-**Tooling baseline**: Node 22 LTS, TypeScript `strict`, ESM, pnpm, ESLint (flat config) + Prettier, Vitest, Husky + lint-staged (pre-commit), Docker for the API image.
+**Tooling baseline**: Node 22 LTS, TypeScript `strict`, ESM, pnpm workspaces, ESLint (flat config) + Prettier, Vitest, Husky + lint-staged (pre-commit), Docker for the API image and for local MongoDB.
 
 ---
 
@@ -206,7 +208,7 @@ RepoPilot-AI/
 /sign-in, /sign-up        Clerk components
 /repos                    Repository list + status badges
 /repos/import             Import by URL / pick from GitHub App installation
-/repos/:repoId            Repo workspace (tabs):
+/repos/:repoId            Repo view (tabs):
    ├─ overview            Summary, languages, frameworks, stats, index status
    ├─ files               File tree + code viewer (?path=&lines=)
    ├─ search              Hybrid search with filters
@@ -250,13 +252,13 @@ Each module = `routes.ts` (HTTP), `service.ts` (business logic), `repo.ts` (data
 | `github` | Repo URL parsing, metadata, tarball fetch, App installation linking, webhooks |
 | `repositories` | Import, list, access control, settings, re-index, delete |
 | `snapshots` | Index-run lifecycle, progress, active-snapshot switch, GC |
-| `files` | Tree, file content by path/line range |
+| `files` | Tree (from `files` metadata), file content fetched from GitHub at the snapshot commit (LRU-cached) |
 | `search` | Hybrid retrieval (shared by search API and chat) |
 | `chat` | Conversations, messages, RAG orchestration, streaming, citations |
 | `insights` | Structure, quality, security findings, dependencies, architecture graph |
 | `docs` | Generated documentation CRUD + generation jobs |
 | `usage` | Token/cost metering and quota checks |
-| `jobs` | Queue abstraction and admin/status endpoints |
+| `jobs` | Queue abstraction, in-process worker loop, status endpoints |
 
 ### 6.3 Cross-cutting libraries
 
@@ -272,7 +274,7 @@ Each module = `routes.ts` (HTTP), `service.ts` (business logic), `repo.ts` (data
 
 ### 7.1 Job queue (MongoDB-backed)
 
-`jobs` collection; worker loop:
+`jobs` collection; worker loop (runs inside the API process when `RUN_WORKER=true`):
 
 ```ts
 // atomic claim with lease
@@ -284,11 +286,11 @@ const job = await Job.findOneAndUpdate(
 );
 ```
 
-- Heartbeat extends `lockedUntil` while a job runs; a reaper re-queues jobs whose lease expired (worker crash).
+- Heartbeat extends `lockedUntil` while a job runs; a reaper re-queues jobs whose lease expired (crash, redeploy, or a Render free-instance spin-down).
 - Exponential backoff on failure up to `maxAttempts`, then `failed` with `lastError`.
 - `dedupeKey` (unique partial index on non-terminal jobs) prevents duplicate ingestions of the same repo/ref.
-- Concurrency per worker configurable; per-user concurrent ingestion limit enforced at enqueue time.
-- Job types: `ingest.snapshot`, `analyze.snapshot`, `docs.generate`, `snapshot.gc`, `repo.delete`, `deps.refreshAdvisories` (scheduled).
+- Concurrency configurable (default 1 ingestion at a time on the Starter instance); per-user concurrent ingestion limit and the global daily import cap are enforced at enqueue time.
+- Job types: `ingest.snapshot` (owns the extracted tarball and runs every file-dependent stage), `analyze.snapshot` (network/AI enrichment from persisted data only), `docs.generate`, `snapshot.gc`, `repo.delete`, `deps.refreshAdvisories` (scheduled).
 
 ### 7.2 Ingestion stages (`ingest.snapshot`)
 
@@ -299,15 +301,17 @@ flowchart TD
   A[resolve ref → commitSha<br/>GET /repos/:o/:r/commits/:ref] --> B[download tarball<br/>GET /repos/:o/:r/tarball/:sha<br/>stream, size-capped]
   B --> C[safe extract + filter<br/>skip binaries, vendored, generated,<br/>lockfiles kept for deps only]
   C --> D[classify files<br/>language, LOC, isTest, isConfig]
-  D --> E[persist files + deduped contents]
+  D --> E[persist file metadata<br/>no full contents, D14]
   E --> F[parse: tree-sitter → symbols, imports]
-  F --> G[chunk: AST-aware, fallback line windows]
+  F --> S[file scans on extracted files<br/>structure, manifests → dependencies,<br/>secrets + risky patterns → findings,<br/>quality metrics → analyses]
+  S --> G[chunk: AST-aware, fallback line windows]
   G --> H[redact secrets from chunk text]
-  H --> I[embed in batches<br/>cache by model+contentHash]
+  H --> I[embed in batches<br/>reuse vectors by embeddingInputHash<br/>if model + dims match]
   I --> J[bulk insert chunks]
-  J --> K[enqueue analyze.snapshot]
-  K --> L[mark snapshot ready<br/>flip repository.activeSnapshotId]
-  L --> M[enqueue GC of previous snapshot]
+  J --> L[mark snapshot ready<br/>flip repository.activeSnapshotId]
+  L --> K[enqueue analyze.snapshot<br/>OSV, registries, import graph,<br/>AI summaries/triage/reviews]
+  K --> M[enqueue GC of previous snapshot]
+  M --> T[finally: delete temp extraction dir]
 ```
 
 Notes:
@@ -315,8 +319,10 @@ Notes:
 - **Tarball over Trees+Blobs API**: one request for the whole repo instead of one per file — critical for rate limits.
 - **Safe extraction**: reject absolute paths and `..` (zip-slip), skip symlinks/devices, cap total decompressed bytes and file count (archive-bomb protection), stream rather than buffer.
 - **Filters**: built-in ignore list (`node_modules/`, `vendor/`, `dist/`, `build/`, `.min.js`, images, fonts, archives, media), binary detection (NUL byte sniff), generated-file heuristics (`// Code generated`, `@generated`), plus optional user `.repopilotignore` and include/exclude globs in repo settings.
-- **Search readiness before analysis**: the snapshot becomes `ready` for browsing/search/chat as soon as chunks are embedded; analyzers run afterwards and their status is tracked per analyzer.
-- **Incremental re-index** (Phase 7): reuse `fileContents` and embeddings whose `contentHash` is unchanged; only new/changed files are parsed and embedded.
+- **Extraction ownership**: the extracted tarball lives in a temp directory owned by the `ingest.snapshot` job and is deleted in a `finally` block when that job ends (success, failure or retry; a retry re-downloads). Every stage that needs file contents (parsing, structure, manifest parsing, secret/pattern scanning, quality metrics, chunking) therefore runs **inside** `ingest.snapshot`. These scans are local and deterministic (no network, no LLM), so they add seconds, not minutes.
+- **Search readiness before enrichment**: the snapshot becomes `ready` for browsing/search/chat as soon as chunks are embedded. `analyze.snapshot` then runs enrichment that needs only persisted data (`files`, `dependencies`, `findings`, `chunks`): OSV/registry lookups, import-graph resolution, architecture narrative, summaries, AI triage and hotspot reviews. Status is tracked per analyzer.
+- **Embedding reuse** (all re-indexes): if the previous snapshot's `embedding.model` **and** `embedding.dimensions` equal the new snapshot's, look up its chunks by `embeddingInputHash` (sha256 of the exact normalized embedding input, i.e. contextual header + chunk text, §7.3) and copy their vectors; only chunks whose embedded input changed (including moved files or renamed symbols) hit the embedding API.
+- **Webhook-driven incremental re-index** (optional Phase 7): additionally skip parsing of files whose blob SHA is unchanged.
 
 ### 7.3 Chunking strategy
 
@@ -343,7 +349,6 @@ erDiagram
   REPOSITORY ||--o{ REPO_ACCESS : "shared by"
   REPOSITORY ||--o{ SNAPSHOT : "indexed as"
   SNAPSHOT ||--o{ FILE : contains
-  FILE }o--|| FILE_CONTENT : "content by hash"
   SNAPSHOT ||--o{ CHUNK : contains
   SNAPSHOT ||--o{ ANALYSIS : produces
   SNAPSHOT ||--o{ FINDING : produces
@@ -359,7 +364,7 @@ erDiagram
 **`users`**
 ```ts
 { clerkUserId: string /*unique*/, email: string, name?: string, avatarUrl?: string,
-  personalWorkspaceId: ObjectId, plan: 'free' | 'pro', githubLogin?: string,
+  plan: 'free' | 'pro', githubLogin?: string,
   limits: { maxRepos: number, monthlyTokenBudget: number },
   deletedAt?: Date }
 ```
@@ -388,13 +393,13 @@ Indexes: `{ clerkUserId: 1 } unique`, `{ email: 1 }`.
 ```
 Indexes: `{ 'github.id': 1 } unique`, `{ 'github.fullName': 1 }`.
 
-**`repoAccess`** — which user/workspace can see which repository
+**`repoAccess`** — which user can see which repository
 ```ts
-{ workspaceId: ObjectId, userId: ObjectId, repositoryId: ObjectId,
+{ userId: ObjectId, repositoryId: ObjectId,
   role: 'owner' | 'viewer', source: 'public' | 'installation',
   verifiedAt: Date, pinned: boolean }
 ```
-Indexes: `{ userId: 1, repositoryId: 1 } unique`, `{ repositoryId: 1 }`, `{ workspaceId: 1 }`.
+Indexes: `{ userId: 1, repositoryId: 1 } unique`, `{ repositoryId: 1 }`.
 
 **`snapshots`** — one indexing run at one commit
 ```ts
@@ -424,11 +429,7 @@ Indexes: `{ repositoryId: 1, createdAt: -1 }`, `{ repositoryId: 1, commitSha: 1,
 ```
 Indexes: `{ snapshotId: 1, path: 1 } unique`, `{ snapshotId: 1, dir: 1 }`, `{ snapshotId: 1, language: 1 }`.
 
-**`fileContents`** — deduplicated by hash across snapshots/repos
-```ts
-{ contentHash: string /*unique*/, content: string, refCount: number }
-```
-(Files > 1 MB are never stored; docs stay far below the 16 MB document limit.)
+File contents are **not** stored (D14). The file viewer fetches `GET /repos/{owner}/{repo}/contents/{path}?ref={commitSha}` (raw media type) and caches by `(repositoryId, commitSha, path)` in an in-memory LRU; content at a commit SHA is immutable, so the cache never needs invalidation.
 
 **`chunks`** — the retrieval unit (vector + full-text indexed)
 ```ts
@@ -436,16 +437,13 @@ Indexes: `{ snapshotId: 1, path: 1 } unique`, `{ snapshotId: 1, dir: 1 }`, `{ sn
   kind: 'code' | 'file_summary' | 'doc',
   symbolName?: string, symbolKind?: string, startLine: number, endLine: number,
   content: string,            // display text (secrets redacted)
-  contentHash: string, tokenCount: number,
-  embedding: number[],        // dimensions per snapshot.embedding
+  contentHash: string,        // sha256 of display text
+  embeddingInputHash: string, // sha256 of exact embedded input (contextual header + text)
+  tokenCount: number,
+  embedding: Binary,          // BSON binData float32 vector; model + dims per snapshot.embedding
   embeddingModel: string }
 ```
-Indexes: `{ snapshotId: 1, fileId: 1 }`, plus Atlas Vector Search + Atlas Search indexes (§9).
-
-**`embeddingCache`**
-```ts
-{ model: string, contentHash: string, embedding: number[] }  // unique (model, contentHash)
-```
+Indexes: `{ snapshotId: 1, fileId: 1 }`, `{ snapshotId: 1, embeddingInputHash: 1 }` (embedding reuse from the previous snapshot), plus Atlas Vector Search + Atlas Search indexes (§9).
 
 **`analyses`** — one document per analyzer per snapshot (typed `result` per `type`)
 ```ts
@@ -462,10 +460,17 @@ Index: `{ snapshotId: 1, type: 1 } unique`.
   title: string, description: string, path?: string, startLine?: number, endLine?: number,
   redactedSnippet?: string, fingerprint: string /*stable across snapshots*/,
   dependency?: { ecosystem: string, name: string, version: string, advisoryIds: string[] },
-  aiExplanation?: string, remediation?: string,
-  state: 'open' | 'dismissed', dismissedBy?: ObjectId, dismissReason?: string }
+  aiExplanation?: string, remediation?: string }
 ```
-Indexes: `{ snapshotId: 1, category: 1, severity: 1 }`, `{ repositoryId: 1, fingerprint: 1 }` (carry dismissals forward).
+Indexes: `{ snapshotId: 1, category: 1, severity: 1 }`, `{ repositoryId: 1, fingerprint: 1 }`.
+
+Findings are shared derived data (D7) and carry no user state.
+
+**`findingDismissals`** — per-user dismissal state, keyed by fingerprint so it survives re-indexing
+```ts
+{ userId, repositoryId, fingerprint: string, reason?: string, createdAt: Date }
+```
+Index: `{ userId: 1, repositoryId: 1, fingerprint: 1 } unique`. Listing findings overlays the caller's dismissals (`state = dismissed` if a matching record exists); one user's dismissal never changes what another user sees.
 
 **`dependencies`**
 ```ts
@@ -488,7 +493,7 @@ Indexes: `{ snapshotId: 1, ecosystem: 1, name: 1 }`.
 
 **`conversations`**
 ```ts
-{ workspaceId, userId, repositoryId, snapshotId, title: string, lastMessageAt: Date, archived: boolean }
+{ userId, repositoryId, snapshotId, title: string, lastMessageAt: Date, archived: boolean }
 ```
 Index: `{ userId: 1, repositoryId: 1, lastMessageAt: -1 }`.
 
@@ -513,7 +518,7 @@ Indexes: `{ status: 1, runAt: 1, priority: -1 }`, `{ dedupeKey: 1 } unique, part
 
 **`usageEvents`**
 ```ts
-{ userId, workspaceId, repositoryId?, kind: 'embedding' | 'chat' | 'summary' | 'docs' | 'triage',
+{ userId, repositoryId?, kind: 'embedding' | 'chat' | 'summary' | 'docs' | 'triage',
   model: string, promptTokens: number, completionTokens: number, costUsd: number }
 ```
 Indexes: `{ userId: 1, createdAt: -1 }`; monthly totals computed via aggregation (cached on user).
@@ -522,7 +527,7 @@ Indexes: `{ userId: 1, createdAt: -1 }`; monthly totals computed via aggregation
 
 ### 8.3 Data lifecycle
 
-- New snapshot becomes active → previous snapshot marked `superseded` → `snapshot.gc` job deletes its `files`, `chunks`, `analyses`, `dependencies`, decrements `fileContents.refCount`. Conversations keep their own `snapshotId`; citations remain resolvable as long as content exists (keep last N=2 snapshots; older conversations degrade to GitHub permalinks).
+- New snapshot becomes active → previous snapshot marked `superseded` → `snapshot.gc` job keeps the **last 2 snapshots** per repo and deletes older snapshots' `files`, `chunks`, `analyses`, `findings`, `dependencies`. Conversations keep their own `snapshotId`; citations on deleted snapshots degrade to GitHub permalinks at the original commit SHA (still exact, since content is fetched by SHA).
 - Removing the last `repoAccess` for a repository → `repo.delete` job removes all derived data.
 - Clerk `user.deleted` webhook → delete user, access rows, conversations, usage; repos follow the rule above.
 
@@ -542,7 +547,9 @@ Indexes: `{ userId: 1, createdAt: -1 }`; monthly totals computed via aggregation
   ]
 }
 ```
-`numDimensions` must match the chosen model (D4). Path-prefix filtering uses the precomputed `dirs` ancestor array (vector-search filters don't support regex).
+`numDimensions` must match the chosen model (D4: `voyage-code-4`, 1024, or 512 if supported). Vectors are ingested as BSON `binData` float32 (~66% less disk than arrays of doubles — important on the 512 MB Free tier). Automatic scalar quantization can be enabled later (> ~100k vectors). Path-prefix filtering uses the precomputed `dirs` ancestor array (vector-search filters don't support regex). Filters are always applied **inside** `$vectorSearch` (pre-filter), never as a post-`$match`.
+
+These two indexes are the only search indexes in the project, which fits the Atlas Free tier limit of 3.
 
 **Full-text index** on `chunks` (`chunks_text`): `content`, `path`, `symbolName` with a code-friendly analyzer (split on non-alphanumerics and camelCase/snake_case boundaries) so `getUserById` matches "get user by id".
 
@@ -559,12 +566,12 @@ Indexes: `{ userId: 1, createdAt: -1 }`; monthly totals computed via aggregation
              { text: { query, path: 'path', score: { boost: { value: 2 } } } }] } } },
 { $limit: 40 }
 // 3) fuse in application code with Reciprocal Rank Fusion: score = Σ 1 / (60 + rank_i)
-//    (switch to native $rankFusion if available on our Atlas version)
+//    (kept in app code: portable across Atlas tiers/versions and unit-testable)
 ```
 
 Index definitions live in code (`apps/api/src/db/searchIndexes.ts`) and are applied idempotently by a migration script (`createSearchIndex`/`updateSearchIndex`), not by hand in the Atlas UI.
 
-**Local development**: `mongodb-memory-server` has no Atlas Search. Use the **Atlas CLI local deployment** (Docker) for search/vector features, or a shared dev cluster.
+**Local development & CI**: `docker compose up` starts the official **`mongodb/mongodb-atlas-local`** image (mongod + mongot) with `$search` and `$vectorSearch` support; the same index script runs against it. CI uses the same image as a service container for search integration tests. `mongodb-memory-server` is used only for fast unit/integration tests that don't need search.
 
 ---
 
@@ -572,10 +579,12 @@ Index definitions live in code (`apps/api/src/db/searchIndexes.ts`) and are appl
 
 ### 10.1 Providers
 
-- **OpenRouter** via its OpenAI-compatible REST API (`/api/v1/chat/completions`, streaming). Requests set `HTTP-Referer`/`X-Title`, model fallbacks, and provider preferences with data-collection opt-out.
+- **OpenRouter** for everything AI via its OpenAI-compatible REST API: `/api/v1/chat/completions` (streaming) and `/api/v1/embeddings` (`voyageai/voyage-code-4`). Requests set `HTTP-Referer`/`X-Title`, model fallbacks, and `provider: { data_collection: "deny" }`.
+- Models (env): `CHAT_MODEL=google/gemini-2.5-flash`, `FAST_MODEL=google/gemini-2.5-flash-lite`, optional `PREMIUM_CHAT_MODEL`, `EMBEDDING_MODEL=voyageai/voyage-code-4`.
+- Cost guardrails: a hard credit limit on the OpenRouter API key (separate dev/prod keys), per-user monthly token caps, content-hash reuse of embeddings and summaries.
 - `LLMClient` and `EmbeddingProvider` interfaces isolate vendors; every call records usage to `usageEvents`.
 
-### 10.2 Indexing-time AI (worker)
+### 10.2 Indexing-time AI (worker loop)
 
 1. **File summaries** (`FAST_MODEL`) for "important" files: entry points, most-imported modules, READMEs, top-N by centrality — capped per snapshot. Cached by `contentHash` across snapshots.
 2. **Directory summaries** bottom-up from file summaries.
@@ -629,7 +638,7 @@ Details:
 
 ## 11. Feature designs (analyzers)
 
-All analyzers run in the worker on stored files; none execute repository code. Each writes to `analyses` / `findings` / `dependencies` and updates `snapshot.analyzers[name]`.
+Analyzers are split by input (§7.2): **file scans** read the extracted tarball and run inside `ingest.snapshot` before its temp directory is deleted; **enrichment** runs in `analyze.snapshot` from persisted data only. None execute repository code. Each writes to `analyses` / `findings` / `dependencies` and updates `snapshot.analyzers[name]`.
 
 ### 11.1 Structure analysis
 - Tree with per-directory aggregates (files, LOC, languages).
@@ -638,7 +647,7 @@ All analyzers run in the worker on stored files; none execute repository code. E
 - AI overview (§10.2).
 
 ### 11.2 Architecture visualization
-- **Import graph** from tree-sitter `imports`, resolved to repo files (relative paths, TS path aliases from `tsconfig.json`, Python packages, Go module paths). Unresolved → external package nodes.
+- **Import graph** from tree-sitter `imports` (TS/JS, Python) and regex import detection for other languages, resolved to repo files (relative paths, TS path aliases from `tsconfig.json`, Python packages). Unresolved → external package nodes.
 - Aggregated to **directory/module level** (configurable depth) to keep graphs readable; edge weight = import count. Cycle detection (Tarjan SCC) surfaced as insights.
 - Centrality (in-degree/PageRank) identifies core modules — reused for summary prioritisation.
 - AI pass labels modules into layers (UI, API, domain, data, infra) and writes a narrative; output also as a Mermaid diagram for docs.
@@ -655,10 +664,10 @@ All analyzers run in the worker on stored files; none execute repository code. E
 - **Risky patterns** (per language): `eval`/`new Function`, `child_process.exec` with interpolation, SQL built by string concatenation, disabled TLS verification, weak hashes/ciphers, permissive CORS, `dangerouslySetInnerHTML`, insecure deserialization, hard-coded credentials in config.
 - **Config checks**: GitHub Actions using `pull_request_target` with checkout of PR code, unpinned third-party actions, Dockerfile running as root / `latest` tags.
 - **AI triage** (`FAST_MODEL`): explains each high/critical pattern finding, estimates likelihood of a true positive, proposes remediation — clearly labelled as AI-generated.
-- Dismissals persist across snapshots via `fingerprint`.
+- Dismissals are per user (`findingDismissals`) and persist across snapshots via `fingerprint`.
 
 ### 11.5 Dependency analysis
-- Parsers: `package.json` + `package-lock.json`/`pnpm-lock.yaml`/`yarn.lock`; `requirements*.txt`, `pyproject.toml`, `poetry.lock`; `go.mod`/`go.sum`; `Cargo.toml`/`Cargo.lock`; later `pom.xml`, `Gemfile.lock`.
+- Parsers: `package.json` + `package-lock.json`/`pnpm-lock.yaml`/`yarn.lock`; `requirements*.txt`, `pyproject.toml`, `poetry.lock`; `go.mod`/`go.sum`; `Cargo.toml`/`Cargo.lock`; later `pom.xml`, `Gemfile.lock`. (Manifest parsing is independent of AST language support, D12.)
 - Direct vs transitive, prod vs dev; latest version + license from registries (npm registry, PyPI JSON, proxy.golang.org, crates.io) with response caching (24 h) and polite rate limits.
 - Outputs: per-ecosystem tables, outdated by semver delta, license summary (flag copyleft), vulnerability join, "where is this used" (files importing the package).
 
@@ -690,7 +699,7 @@ REST, JSON, base path `/api/v1`. Auth: `Authorization: Bearer <Clerk session tok
 | `GET /me` | Current user, plan, limits, usage this month |
 | `GET /me/usage?from&to` | Usage breakdown |
 | **GitHub** | |
-| `GET /github/install-url` | GitHub App install URL with signed `state` (Phase 7) |
+| `GET /github/install-url` | GitHub App install URL with signed `state` (optional Phase 7) |
 | `GET /github/callback` | Installation/OAuth callback → verify & link installation |
 | `GET /github/installations` | Linked installations |
 | `GET /github/installations/:id/repositories` | Repos available to import |
@@ -700,13 +709,13 @@ REST, JSON, base path `/api/v1`. Auth: `Authorization: Bearer <Clerk session tok
 | `GET /repositories` | List accessible repos with status |
 | `GET /repositories/:repoId` | Repo detail incl. active snapshot + analyzer statuses |
 | `PATCH /repositories/:repoId` | Update settings (include/exclude globs, tracked ref) |
-| `DELETE /repositories/:repoId` | Remove from my workspace (data GC if last user) |
+| `DELETE /repositories/:repoId` | Remove from my repositories (data GC if last user) |
 | `POST /repositories/:repoId/reindex` | New snapshot at latest commit of tracked ref → `202` |
 | `GET /repositories/:repoId/snapshots` | Snapshot history |
 | `GET /repositories/:repoId/snapshots/:snapshotId` | Status/progress (polled by UI) |
 | **Files** | |
 | `GET /repositories/:repoId/tree?path=` | Directory listing (lazy) or full tree |
-| `GET /repositories/:repoId/file?path=&startLine=&endLine=` | File content + metadata (symbols, summary) |
+| `GET /repositories/:repoId/file?path=&startLine=&endLine=` | File content (fetched from GitHub at the snapshot commit, LRU-cached) + metadata (symbols, summary) |
 | **Search** | |
 | `POST /repositories/:repoId/search` | `{ query, mode: 'hybrid'\|'semantic'\|'keyword', filters: { language?, dir?, kind? }, limit }` → ranked chunks with highlights |
 | **Chat** | |
@@ -722,7 +731,7 @@ REST, JSON, base path `/api/v1`. Auth: `Authorization: Bearer <Clerk session tok
 | `GET /repositories/:repoId/architecture?depth=` | Graph `{ nodes, edges, layers, narrative, mermaid }` |
 | `GET /repositories/:repoId/quality` | Scorecard, metrics, hotspots, AI review |
 | `GET /repositories/:repoId/findings?category=&severity=&state=` | Security/quality findings (paginated) |
-| `PATCH /findings/:findingId` | Dismiss / reopen `{ state, reason }` |
+| `PATCH /findings/:findingId` | Dismiss / reopen for the caller only `{ state, reason }` (upserts/deletes `findingDismissals`) |
 | `GET /repositories/:repoId/dependencies?ecosystem=&outdated=&vulnerable=` | Dependency list + summary |
 | **Docs** | |
 | `GET /repositories/:repoId/docs` | Generated documents |
@@ -739,8 +748,8 @@ REST, JSON, base path `/api/v1`. Auth: `Authorization: Bearer <Clerk session tok
 |---|---|
 | Repository & all derived data | Caller has a `repoAccess` row for `repositoryId`; for private repos the access must be backed by a linked, non-suspended installation that still includes the repo (re-verified on import, on webhook events, and lazily if `verifiedAt` > 24 h). |
 | Snapshot | Belongs to an accessible repository. |
-| Conversation / message | `conversation.userId === caller` (team sharing later via workspace role). |
-| Finding dismissal | Repo access with role `owner`. |
+| Conversation / message | `conversation.userId === caller`. |
+| Finding dismissal | Any user with repo access; affects only that user's own view. |
 | GitHub installation | Linked to the caller via verified OAuth flow. |
 
 ---
@@ -780,21 +789,21 @@ REST, JSON, base path `/api/v1`. Auth: `Authorization: Bearer <Clerk session tok
 - Frontend renders code as text (Shiki tokens) and Markdown without raw HTML; strict CSP on Vercel (`script-src 'self'` + Clerk domains), `frame-ancestors 'none'`.
 
 **Secrets & sensitive data**
-- Detected secrets redacted before persistence in `chunks`, before embedding, and before any LLM call; findings store fingerprints + redacted snippets only.
+- Detected secrets redacted before persistence in `chunks`, before embedding, and before any LLM call; findings store fingerprints + redacted snippets only. Full file contents are never persisted (D14); the viewer shows GitHub content the user is already authorized to read.
 - Pino redaction for auth headers, tokens and file content; no code in error-tracker payloads.
 - App secrets (Clerk, OpenRouter, GitHub App private key, webhook secrets, Mongo URI) only in host env vars; separate values per environment; rotation documented. If any user-provided token is ever stored, it is encrypted with AES-256-GCM using a key from env (envelope-ready).
-- Atlas: TLS, encryption at rest, IP access list / private endpoint for the backend, least-privilege DB user per environment, backups on production tier.
+- Atlas: TLS, encryption at rest, separate projects + least-privilege DB users for dev and prod, IP access list as tight as the host allows (Render outbound IPs). Backups require a paid tier (Flex/M10+); on Free, snapshots are re-creatable from GitHub, and only users/conversations would be lost.
 
 **Abuse & cost**
 - Rate limits (per IP + per user) on all endpoints, stricter on chat/search/import.
-- Per-user quotas: repos, concurrent ingestions, monthly tokens; enforced before enqueue / before LLM calls (`402/429` with clear codes).
+- Per-user quotas: repos, concurrent ingestions, monthly tokens, plus a global daily import cap; enforced before enqueue / before LLM calls (`402/429` with clear codes). Hard backstop: OpenRouter key credit limit.
 - Repo size limits (D8) checked using GitHub metadata before download and enforced during extraction.
 
 **Transport & headers**: HTTPS everywhere, `helmet`, CORS allowlist, `trust proxy` configured for the host, JSON body size limits.
 
 **Supply chain**: lockfile committed, Dependabot, `pnpm audit` in CI, pinned GitHub Actions, minimum release age for new dependency versions.
 
-**Privacy**: clear disclosure that code is processed by third-party LLM providers via OpenRouter; provider data-collection opt-out; data deletion on repo removal and account deletion; audit log for security-relevant actions.
+**Privacy**: clear disclosure that code is processed by third-party LLM providers via OpenRouter; `data_collection: "deny"` on every request (requests fail rather than fall back to providers that retain data); data deletion on repo removal and account deletion; audit log for security-relevant actions.
 
 ---
 
@@ -802,27 +811,30 @@ REST, JSON, base path `/api/v1`. Auth: `Authorization: Bearer <Clerk session tok
 
 | Component | Platform | Notes |
 |---|---|---|
-| Frontend | **Vercel** | Static Vite build; SPA rewrite to `index.html`; preview deploys per PR; env `VITE_API_URL`, `VITE_CLERK_PUBLISHABLE_KEY`. |
-| API | **Render web service** (D2) | Docker image from `apps/api`; `node dist/server.js`; health check `/readyz`; autoscale on CPU. |
-| Worker | **Render background worker** | Same image; `node dist/worker.js`; scale by queue depth. |
-| Database | **MongoDB Atlas** | Separate projects/clusters for dev/staging/prod; Search + Vector indexes applied by migration. |
-| Auth | **Clerk** | Dev and prod instances. |
+| Frontend | **Vercel Hobby** | Static Vite build; SPA rewrite to `index.html`; preview deploys per PR; env `VITE_API_URL`, `VITE_CLERK_PUBLISHABLE_KEY`. |
+| API + worker | **Render web service** (D2) | One Docker image from `apps/api`; `node dist/server.js` with `RUN_WORKER=true`; health check `/readyz`. Free instance for dev, **Starter ($7/mo)** for the demo. |
+| Worker (future) | Render background worker | Only if needed: same image, `node dist/worker.js`, `RUN_WORKER=false` on the web service. |
+| Database | **MongoDB Atlas Free (M0)** | Separate Atlas projects for dev and prod; Flex at ~400 MB; Search + Vector indexes applied by script. |
+| Local DB | `mongodb/mongodb-atlas-local` (Docker Compose) | Local + CI search/vector support. |
+| Auth | **Clerk** (free plan) | Dev and prod instances. |
+| AI | **OpenRouter** | Separate dev/prod API keys, each with a credit limit. |
 | Secrets | Host env vars | Never in repo; `.env.example` documents names. |
 
-**Environments**: `local` (Docker Atlas local deployment or dev cluster) → `staging` (auto-deploy from `main`) → `production` (promote tagged releases).
+**Environments**: `local` (Docker Compose `mongodb-atlas-local`, Clerk dev instance, OpenRouter dev key) → `production/demo` (auto-deploy from `main` after CI passes). A separate staging environment is deferred until there are real users; Vercel PR previews point at the production API.
 
-**CI/CD (GitHub Actions)**: install → lint → typecheck → unit/integration tests → build web & api → Docker build → deploy hooks. PR previews: Vercel frontend against staging API.
+**CI/CD (GitHub Actions)**: install → lint → typecheck → unit/integration tests (search tests against the `mongodb-atlas-local` service container; GitHub/OpenRouter mocked) → build web & api → Docker build. Render and Vercel auto-deploy from `main`.
 
-**Key env vars (API)**: `MONGODB_URI`, `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET`, `CORS_ORIGINS`, `OPENROUTER_API_KEY`, `CHAT_MODEL`, `FAST_MODEL`, `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `VOYAGE_API_KEY` (if D4 = Voyage), `GITHUB_SERVICE_TOKEN`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`, `GITHUB_WEBHOOK_SECRET`, `SENTRY_DSN`, `LOG_LEVEL`.
+**Key env vars (API)**: `MONGODB_URI`, `RUN_WORKER`, `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET`, `CORS_ORIGINS`, `OPENROUTER_API_KEY`, `CHAT_MODEL`, `FAST_MODEL`, `PREMIUM_CHAT_MODEL`, `EMBEDDING_PROVIDER` (`openrouter` | `voyage`), `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `VOYAGE_API_KEY` (fallback only), `GITHUB_SERVICE_TOKEN`, `DAILY_IMPORT_CAP`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET`, `GITHUB_WEBHOOK_SECRET` (Phase 7 only), `SENTRY_DSN`, `LOG_LEVEL`.
 
 ---
 
 ## 15. Observability, cost control & quotas
 
 - **Logs**: pino JSON with `requestId`, `userId`, `repositoryId`, `jobId`; shipped by the host's log drain.
-- **Errors**: Sentry (frontend + API + worker) with PII/code scrubbing.
+- **Errors**: Sentry free plan (optional) for frontend + API with PII/code scrubbing; otherwise Render logs.
 - **Metrics** (logged + dashboard): ingestion duration per stage, files/chunks per snapshot, embedding throughput, queue depth/latency, chat latency (retrieval vs first-token vs total), tokens & cost per feature, citation-validity rate, analyzer failure rates.
-- **Cost controls**: content-hash caching of embeddings and summaries, shared public indexes (D7), fast model for bulk work, per-snapshot caps on summaries/AI reviews, per-user monthly token budget, alerting on daily spend.
+- **Cost controls**: content-hash reuse of embeddings and summaries, shared public indexes (D7), fast model for bulk work, per-snapshot caps on summaries/AI reviews, per-user monthly token budget, global daily import cap, OpenRouter key credit limit.
+- **Expected spend (demo scale)**: fixed $0 (dev) / $7 per month (Render Starter); OpenRouter ≈ $10–15 per month (≈ $0.25 embeddings + ≈ $0.08 summaries per 1,000-file repo; ≈ $0.006 per chat answer on Gemini 2.5 Flash).
 
 ---
 
@@ -832,7 +844,7 @@ REST, JSON, base path `/api/v1`. Auth: `Authorization: Bearer <Clerk session tok
 |---|---|---|
 | Unit | Vitest | Parsers, chunker, secret rules, manifest parsers, RRF, citation parser, URL parsing, quota math |
 | Integration (API) | Vitest + Supertest + `mongodb-memory-server` | Routes, validation, authz/IDOR, job queue claims/leases, webhooks (signature fixtures) |
-| Search integration | Atlas CLI local deployment (Docker) in a dedicated CI job | Vector + text index queries, hybrid fusion |
+| Search integration | `mongodb/mongodb-atlas-local` service container in CI | Vector + text index queries, hybrid fusion, snapshot isolation |
 | External services | Recorded fixtures / MSW / nock | GitHub, OpenRouter, OSV — no live calls in CI |
 | Frontend | Vitest + Testing Library | Components, citation rendering, SSE parser |
 | E2E | Playwright | Sign-in (Clerk testing tokens), import a small fixture repo, search, chat with citations |
@@ -846,12 +858,14 @@ Coverage targets: ≥ 80% on `ingestion/`, `analyzers/`, `ai/` and authorization
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Large monorepos exceed limits / cost | Failed imports, spend spikes | Pre-check size via GitHub metadata, hard caps, include/exclude globs, sub-path import later |
+| Large monorepos exceed limits / cost | Failed imports, spend spikes | Pre-check size via GitHub metadata, hard caps (D8), include/exclude globs, sub-path import later |
+| Render Free spin-down / small instance | Slow cold starts and ingestion | Starter instance for the demo; job leases resume interrupted jobs; ingestion concurrency 1 |
 | GitHub rate limits | Import failures | Tarball download (1 call/repo), service token / App tokens, ETag caching, backoff |
 | Embedding model change | Incompatible vectors | Model+dims stored per snapshot/chunk; re-index on change; never mix |
-| Atlas tier limits on search indexes/storage | Blocked scaling | Few, shared indexes filtered by `snapshotId`; M10+ in prod; snapshot GC |
+| Atlas Free tier limits (512 MB, 3 search indexes) | Blocked scaling | Only 2 search indexes; `binData` vectors; no stored file contents; keep last 2 snapshots; size caps; upgrade path Free → Flex → M10 |
 | Hallucinated answers | Loss of trust | Strict citation contract, server-side validation, "insufficient context" behaviour, eval harness |
 | Prompt injection via repo content | Misleading output | No side-effecting tools, delimiting, sanitized rendering |
 | Tree-sitter WASM coverage/perf | Missing symbols | Fallback chunking; parse in worker with time budgets |
 | OpenRouter outage/model deprecation | Chat down | Model fallback list, env-configurable models, graceful error UI |
-| Mongo-backed queue throughput | Slow ingestion at scale | `JobQueue` interface → BullMQ swap; scale workers horizontally |
+| Mongo-backed queue / in-process worker throughput | Slow ingestion at scale | Split worker into its own Render service (config only); `JobQueue` interface → BullMQ swap |
+| GitHub dependency for file viewing | Viewer fails if GitHub is down / rate-limited | LRU cache by commit SHA; chunk snippets still render citations |
